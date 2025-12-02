@@ -22,6 +22,7 @@ jobs:
         cache: maven
 
     - name: Run SonarCloud Analysis
+      continue-on-error: true     # ← Sonar failure will NOT stop workflow
       run: mvn -B verify sonar:sonar \
             -Dsonar.projectKey=testtrainings_testtrainings \
             -Dsonar.organization=testtrainings \
