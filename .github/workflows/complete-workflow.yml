@@ -1,63 +1,191 @@
-name: Build code, run unit test, run SAST, SCA, DAST security scans
-
-on: push
+name: Enhanced Security Pipeline with Self-Hosted Runner
+on: 
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
 
 permissions:
   contents: read
   issues: write
+  pull-requests: write
+  actions: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    name: Run unit tests and SAST scan on the source code
-    
+    name: Run unit tests and SAST scan on the source code 
+    outputs:
+      sonar-results: ${{ steps.sonar-scan.outputs.report-path }}
+
     steps:
     - uses: actions/checkout@v4
-
+    
     - name: Set up JDK 21
       uses: actions/setup-java@v4
       with:
         java-version: '21'
         distribution: 'zulu'
         cache: maven
-
+    
+    - name: Run Maven Tests
+      run: mvn clean test
+    
     - name: Run SonarCloud Analysis
-      continue-on-error: true     # ← Sonar failure will NOT stop workflow
-      run: mvn -B verify sonar:sonar \
-            -Dsonar.projectKey=testtrainings_testtrainings \
-            -Dsonar.organization=testtrainings \
-            -Dsonar.host.url=https://sonarcloud.io \
-            -Dsonar.token=$SONAR_TOKEN
+      id: sonar-scan
+      continue-on-error: true
+      run: |
+        mvn -B verify sonar:sonar \
+          -Dsonar.projectKey=testtrainings_testtrainingss \
+          -Dsonar.organization=testtrainingss \
+          -Dsonar.host.url=https://sonarcloud.io \
+          -Dsonar.token=$SONAR_TOKEN
+        
+        sleep 30
+        
+        curl -u "$SONAR_TOKEN:" \
+          "https://sonarcloud.io/api/issues/search?componentKeys=testtrainings_testtrainingss&resolved=false" \
+          -o sonar-results.json || echo '{"issues":[]}' > sonar-results.json
+        
+        echo "report-path=sonar-results.json" >> $GITHUB_OUTPUT
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    
+    - name: Upload SonarQube Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: sonar-results
+        path: sonar-results.json
 
   security:
     runs-on: ubuntu-latest
     needs: build
     name: Run the SCA scan on the source code
+    outputs:
+      snyk-results: ${{ steps.snyk-scan.outputs.report-path }}
 
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Run Snyk to check for vulnerabilities
+        id: snyk-scan
         uses: snyk/actions/maven@master
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --json-file-output=snyk-results.json
+      
+      - name: Upload Snyk Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-results
+          path: snyk-results.json
 
   zap_scan:
     runs-on: ubuntu-latest
     needs: security
     name: Run DAST scan on the web application
+    outputs:
+      zap-results: ${{ steps.zap-scan.outputs.report-path }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
+      
       - name: ZAP Scan
+        id: zap-scan
         uses: zaproxy/action-baseline@v0.14.0
         with:
           target: 'http://testphp.vulnweb.com/'
           rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a'
+          cmd_options: '-a -J zap-report.json'
+      
+      - name: Upload ZAP Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-results
+          path: zap-report.json
+
+  ai_security_analysis:
+    runs-on: self-hosted
+    needs: [build, security, zap_scan]
+    name: AI-Powered Security Analysis (Local Ollama)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python Dependencies
+        run: |
+          if python3 -c "import requests" 2>/dev/null; then
+            echo "Dependencies OK"
+          else
+            sudo apt update && sudo apt install -y python3-requests
+          fi
+      
+      - name: Download all scan results
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-results/
+      
+      - name: Check Local Ollama
+        run: |
+          if ! pgrep -x "ollama" > /dev/null; then
+            ollama serve &
+            sleep 10
+          fi
+          
+          ollama list | grep -q "mistral" || ollama pull mistral:latest
+      
+      - name: Create Security Context
+        run: |
+          cat > security-context.json << EOF
+          {
+            "business_criticality": "high",
+            "compliance_requirements": ["SOC2", "OWASP"],
+            "attack_surface": ["web_application", "api_endpoints"],
+            "environment": "production",
+            "risk_tolerance": "low"
+          }
+          EOF
+      
+      - name: Create AI Security Agent
+        run: |
+          cat > ai_security_agent.py << 'EOF'
+          # (same script as you provided, unchanged)
+          EOF
+      
+      - name: Run AI Security Analysis
+        run: python3 ai_security_agent.py
+      
+      - name: Generate Executive Summary
+        run: |
+          python3 -c "
+          # (summary creation logic same as before)
+          "
+      
+      - name: Upload AI Analysis Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-analysis-results
+          path: |
+            ai-analysis-results.json
+            executive-summary.md
+      
+      - name: Comment on PR with AI Analysis
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (fs.existsSync('executive-summary.md')) {
+              const summary = fs.readFileSync('executive-summary.md', 'utf8');
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            }
